@@ -1,6 +1,7 @@
-# At top of file: add imports
+# --- Begin DIAGNOSTIC + FALLBACK lyrics code ---
 import aiohttp
 import asyncio
+import socket
 import re
 import os
 import time
@@ -8,178 +9,241 @@ import json
 import traceback
 from discord import app_commands
 
-# ---------- async helper: fetch lyrics via Genius API + page scraping ----------
-async def fetch_lyrics_from_genius(query: str, timeout: float = 10.0, retries: int = 2):
-    """
-    Async fetch that:
-      1. Calls Genius API search to get song path
-      2. Fetches song page HTML and extracts lyrics containers
-    Returns dict: {"title":..., "artist":..., "lyrics":...} or None on failure.
-    Logs details via print for Render logs.
-    """
+# Shared aiohttp session (reuse to reduce overhead)
+_session: aiohttp.ClientSession | None = None
+def get_session():
+    global _session
+    if _session is None or _session.closed:
+        _session = aiohttp.ClientSession()
+    return _session
+
+async def safe_head(url: str, timeout: float = 5.0):
+    """Return (status, text_snippet or None, error_or_None)"""
+    try:
+        sess = get_session()
+        async with sess.head(url, timeout=timeout) as r:
+            text = None
+            try:
+                text = (await r.text())[:400]
+            except Exception:
+                text = None
+            return r.status, text, None
+    except Exception as e:
+        return None, None, repr(e)
+
+async def safe_get(url: str, timeout: float = 8.0):
+    try:
+        sess = get_session()
+        async with sess.get(url, timeout=timeout) as r:
+            text = await r.text()
+            return r.status, text, None
+    except Exception as e:
+        return None, None, repr(e)
+
+# small helper to split "Artist - Title" when possible
+def split_artist_title(query: str):
+    if " - " in query:
+        parts = query.split(" - ", 1)
+        return parts[0].strip(), parts[1].strip()
+    return None, query.strip()
+
+# ---------- DIAGNOSTIC command ----------
+@app_commands.command(name="lyricsdiag", description="Diagnose connectivity to Genius (for /lyrics issues).")
+@app_commands.describe(query="Optional song name to include in diagnostics")
+async def lyricsdiag(interaction: discord.Interaction, query: str = ""):
+    await interaction.response.defer(thinking=True)
+    start = time.time()
+    results = {}
+    # 1) DNS resolution check for api.genius.com and genius.com
+    for host in ("api.genius.com", "genius.com"):
+        try:
+            addrs = socket.getaddrinfo(host, 443)
+            results[f"dns_{host}"] = f"OK ({len(addrs)} addresses)"
+            print(f"[lyricsdiag] DNS {host} -> {addrs[0][4]}")
+        except Exception as e:
+            results[f"dns_{host}"] = f"ERROR: {repr(e)}"
+            print(f"[lyricsdiag] DNS error for {host}: {e}")
+
+    # 2) HEAD to api.genius.com
+    status, snippet, err = await safe_head("https://api.genius.com/", timeout=6)
+    results["api_head_status"] = status
+    results["api_head_err"] = err
+    if snippet:
+        results["api_head_snippet"] = snippet[:200]
+
+    # 3) HEAD to genius.com
+    status2, snippet2, err2 = await safe_head("https://genius.com/", timeout=6)
+    results["page_head_status"] = status2
+    results["page_head_err"] = err2
+    if snippet2:
+        results["page_head_snippet"] = snippet2[:200]
+
+    # 4) optional: try small search via Genius API (unauthenticated short call) — won't work without token but we try to show connectivity
+    token = os.getenv("GENIUS_API_TOKEN")
+    if token:
+        try:
+            sess = get_session()
+            async with sess.get("https://api.genius.com/search", params={"q": query or "Adele Hello"}, headers={"Authorization": f"Bearer {token}"}, timeout=8) as r:
+                txt = await r.text()
+                results["api_search_status"] = r.status
+                results["api_search_snippet"] = txt[:300]
+        except Exception as e:
+            results["api_search_err"] = repr(e)
+    else:
+        results["api_search_err"] = "No GENIUS_API_TOKEN in env"
+
+    elapsed = time.time() - start
+    print("[lyricsdiag] Results:", json.dumps(results, default=str)[:2000])
+    # present a short user-visible summary, and print full details to logs
+    summary = []
+    summary.append(f"DNS: api.genius.com -> {results.get('dns_api.genius.com')}")
+    summary.append(f"api.genius.com HEAD -> {results.get('api_head_status')} (err={results.get('api_head_err')})")
+    summary.append(f"genius.com HEAD -> {results.get('page_head_status')} (err={results.get('page_head_err')})")
+    if "api_search_status" in results:
+        summary.append(f"Genius API search -> {results.get('api_search_status')}")
+    else:
+        summary.append("Genius API search -> skipped (no token)")
+    summary_text = "\n".join(summary)
+    try:
+        await interaction.followup.send(f"Diagnostics summary:\n```\n{summary_text}\n```")
+    except Exception as e:
+        print("[lyricsdiag] Failed followup send:", e)
+    print("[lyricsdiag] Full details:", json.dumps(results, default=str))
+    return
+
+# ---------- FALLBACK lyrics fetcher using Genius + lyrics.ovh ----------
+async def fetch_lyrics_from_genius_async(query: str, timeout: float = 8.0, retries: int = 1):
+    """Try the Genius API + page scrape (async). Returns dict or None."""
     token = os.getenv("GENIUS_API_TOKEN")
     if not token:
-        print("[lyrics][fetch] No GENIUS_API_TOKEN in env.")
+        print("[lyricsfallback] No GENIUS_API_TOKEN set — skipping Genius path.")
         return None
 
     search_url = "https://api.genius.com/search"
     headers = {"Authorization": f"Bearer {token}"}
     attempt = 0
-    last_exc = None
-
     while attempt <= retries:
         attempt += 1
-        start = time.time()
         try:
-            # 1) call Genius search API
-            async with aiohttp.ClientSession() as session:
-                # timeout for the whole request/response cycle
-                try:
-                    async with session.get(search_url, params={"q": query}, headers=headers, timeout=timeout) as resp:
-                        text = await resp.text()
-                        status = resp.status
-                except asyncio.TimeoutError:
-                    print(f"[lyrics][fetch] search request timed out (attempt {attempt}) for query={query!r}")
-                    last_exc = "timeout"
-                    await asyncio.sleep(0.5 * attempt)
-                    continue
-
-                print(f"[lyrics][fetch] search HTTP {status} (attempt {attempt}) for query={query!r}")
-                if status != 200:
-                    print(f"[lyrics][fetch] search non-200 status: {status}; body snippet: {text[:200]}")
-                    last_exc = f"status_{status}"
-                    await asyncio.sleep(0.5 * attempt)
-                    continue
-
-                try:
-                    j = json.loads(text)
-                except Exception as e:
-                    print("[lyrics][fetch] Failed to parse JSON from search response:", e)
-                    last_exc = e
-                    await asyncio.sleep(0.5 * attempt)
-                    continue
-
-                # parse first hit
-                hits = j.get("response", {}).get("hits", [])
-                if not hits:
-                    print(f"[lyrics][fetch] No hits for query {query!r}")
-                    return None
-
-                # get top result
-                top = hits[0].get("result", {})
-                song_path = top.get("path")
-                title = top.get("title")
-                artist = top.get("primary_artist", {}).get("name")
-                if not song_path:
-                    print("[lyrics][fetch] No path in top result; returning None")
-                    return None
-
-                song_url = "https://genius.com" + song_path
-                print(f"[lyrics][fetch] Found song URL: {song_url} (title={title!r}, artist={artist!r})")
-
-                # 2) fetch song page HTML
-                try:
-                    async with session.get(song_url, timeout=timeout) as page_resp:
-                        page_status = page_resp.status
-                        page_html = await page_resp.text()
-                except asyncio.TimeoutError:
-                    print(f"[lyrics][fetch] song page request timed out for {song_url}")
-                    last_exc = "timeout_page"
-                    await asyncio.sleep(0.5 * attempt)
-                    continue
-
-                if page_status != 200:
-                    print(f"[lyrics][fetch] song page non-200 status {page_status} for {song_url}")
-                    last_exc = f"page_status_{page_status}"
-                    await asyncio.sleep(0.5 * attempt)
-                    continue
-
-                # Try extracting lyrics:
-                # Newer Genius layout: multiple <div data-lyrics-container="true">...</div>
-                lyrics_parts = re.findall(r'<div[^>]+data-lyrics-container="true"[^>]*>(.*?)</div>', page_html, flags=re.DOTALL | re.IGNORECASE)
-                if not lyrics_parts:
-                    # Fallback to old .lyrics container
-                    m = re.search(r'<div class="lyrics">(.+?)</div>', page_html, flags=re.DOTALL | re.IGNORECASE)
-                    if m:
-                        lyrics_parts = [m.group(1)]
-
-                if not lyrics_parts:
-                    # As a last resort, try to extract from <div class="SongPage__lyrics"> blocks
-                    lyrics_parts = re.findall(r'<div[^>]+class="SongPage__lyrics"[^>]*>(.*?)</div>', page_html, flags=re.DOTALL | re.IGNORECASE)
-
-                if not lyrics_parts:
-                    print("[lyrics][fetch] Could not find lyrics containers in page HTML. Returning snippet for debugging.")
-                    snippet = page_html[:800]
-                    print("[lyrics][fetch] Page snippet:", snippet)
-                    return {"title": title or "Unknown", "artist": artist or "Unknown", "lyrics": ""}
-
-                # Clean HTML tags from parts
-                clean_parts = []
-                for part in lyrics_parts:
-                    # remove <br> and variants with newline placeholder
-                    part = re.sub(r'<br\s*/?>', '\n', part, flags=re.IGNORECASE)
-                    # remove remaining tags
-                    part = re.sub(r'<.*?>', '', part, flags=re.DOTALL)
-                    clean = part.strip()
-                    if clean:
-                        clean_parts.append(clean)
-
-                lyrics_text = "\n\n".join(clean_parts).strip()
-                elapsed = time.time() - start
-                print(f"[lyrics][fetch] Successfully scraped lyrics (len={len(lyrics_text)} chars) in {elapsed:.2f}s")
-                return {"title": title or "Unknown", "artist": artist or "Unknown", "lyrics": lyrics_text}
-
-        except Exception as ex:
-            print(f"[lyrics][fetch] Unexpected exception (attempt {attempt}) for query={query!r}: {ex}")
+            sess = get_session()
+            async with sess.get(search_url, params={"q": query}, headers=headers, timeout=timeout) as r:
+                status = r.status
+                txt = await r.text()
+            print(f"[lyricsfallback] search status={status} len={len(txt) if txt else 0}")
+            if status != 200:
+                print("[lyricsfallback] non-200 search status", status)
+                await asyncio.sleep(0.3 * attempt)
+                continue
+            j = json.loads(txt)
+            hits = j.get("response", {}).get("hits", [])
+            if not hits:
+                print("[lyricsfallback] no hits for query", query)
+                return None
+            top = hits[0].get("result", {})
+            song_path = top.get("path")
+            title = top.get("title")
+            artist = top.get("primary_artist", {}).get("name")
+            if not song_path:
+                print("[lyricsfallback] no path in top hit")
+                return None
+            song_url = "https://genius.com" + song_path
+            # fetch page
+            sess = get_session()
+            async with sess.get(song_url, timeout=timeout) as page_r:
+                page_html = await page_r.text()
+            # attempt to extract lyrics containers
+            parts = re.findall(r'<div[^>]+data-lyrics-container="true"[^>]*>(.*?)</div>', page_html, flags=re.DOTALL | re.IGNORECASE)
+            if not parts:
+                m = re.search(r'<div class="lyrics">(.+?)</div>', page_html, flags=re.DOTALL | re.IGNORECASE)
+                if m:
+                    parts = [m.group(1)]
+            if not parts:
+                print("[lyricsfallback] no lyrics parts found; returning empty lyrics")
+                return {"title": title or "Unknown", "artist": artist or "Unknown", "lyrics": ""}
+            clean = []
+            for p in parts:
+                p = re.sub(r'<br\s*/?>', '\n', p, flags=re.IGNORECASE)
+                p = re.sub(r'<.*?>', '', p, flags=re.DOTALL)
+                p = p.strip()
+                if p:
+                    clean.append(p)
+            lyrics_text = "\n\n".join(clean)
+            print(f"[lyricsfallback] scraped len {len(lyrics_text)}")
+            return {"title": title or "Unknown", "artist": artist or "Unknown", "lyrics": lyrics_text}
+        except Exception as e:
+            print("[lyricsfallback] attempt exception:", e)
             traceback.print_exc()
-            last_exc = ex
-            await asyncio.sleep(0.5 * attempt)
-
-    print(f"[lyrics][fetch] Failed all attempts for query={query!r}; last_exc={last_exc}")
+            await asyncio.sleep(0.3 * attempt)
     return None
 
+async def fetch_lyrics_from_lyrics_ovh(query: str, timeout: float = 6.0):
+    """
+    Try the simple lyrics.ovh API as a fallback when Genius fails.
+    Requires artist and title split (Artist - Title). Returns dict or None.
+    """
+    artist, title = split_artist_title(query)
+    if not artist:
+        print("[lyricsovh] Query does not contain 'Artist - Title' form; cannot use lyrics.ovh fallback.")
+        return None
+    api = f"https://api.lyrics.ovh/v1/{artist}/{title}"
+    try:
+        status, text, err = await safe_get(api, timeout=timeout)
+        print("[lyricsovh] status", status, "err", err)
+        if status != 200 or not text:
+            return None
+        j = json.loads(text)
+        lyrics = j.get("lyrics", "")
+        if not lyrics:
+            return None
+        return {"title": title, "artist": artist, "lyrics": lyrics}
+    except Exception as e:
+        print("[lyricsovh] exception", e)
+        return None
 
-# ---------- Replace your slash command handler with this safe handler ----------
-@app_commands.command(name="lyrics", description="Fetch full lyrics for a song.")
+# ---------- Updated /lyrics handler that uses the above ----------
+@app_commands.command(name="lyrics", description="Fetch full lyrics for a song (tries Genius then fallback).")
 @app_commands.describe(query="Song name or 'Artist - Title'")
 async def lyrics_cmd(self, interaction: discord.Interaction, query: str):
-    # Show the thinking UI so Discord doesn't mark the command as unresponded
+    # always defer so we won't get stuck
     await interaction.response.defer(thinking=True)
-    start_time = time.time()
-    print(f"[lyrics] Handler started for query={query!r} by user={interaction.user} in {interaction.guild_id=}")
-
+    start = time.time()
+    print(f"[lyricscmd] invoked by {interaction.user} query={query!r} guild={interaction.guild_id}")
     try:
-        result = await fetch_lyrics_from_genius(query, timeout=10.0, retries=2)
-        elapsed = time.time() - start_time
-        if not result:
-            print(f"[lyrics] No result for {query!r} after {elapsed:.2f}s")
-            await interaction.followup.send("❌ Could not fetch lyrics (timeout, network, or not found). Check logs.")
+        # try Genius async scraper
+        res = await fetch_lyrics_from_genius_async(query, timeout=8.0, retries=1)
+        used = "genius"
+        if res is None:
+            # attempt lyrics.ovh fallback
+            res = await fetch_lyrics_from_lyrics_ovh(query, timeout=6.0)
+            used = "lyrics.ovh" if res else "none"
+        elapsed = time.time() - start
+        if not res:
+            print(f"[lyricscmd] no lyrics found via any provider (elapsed {elapsed:.2f}s)")
+            await interaction.followup.send(f"❌ Could not fetch lyrics for **{query}**. (Tried Genius & lyrics.ovh) See logs.")
             return
-
-        title = result.get("title", "Unknown")
-        artist = result.get("artist", "Unknown")
-        lyrics = result.get("lyrics", "")
-
-        if not lyrics:
-            await interaction.followup.send(f"ℹ️ Found **{title} - {artist}**, but no lyrics were scraped.")
+        title = res.get("title", "Unknown")
+        artist = res.get("artist", "Unknown")
+        lyrics = res.get("lyrics", "")
+        if not lyrics.strip():
+            await interaction.followup.send(f"ℹ️ Found **{title} - {artist}** via {used}, but no lyrics text was scraped.")
             return
-
-        # send header then chunk lyrics
-        await interaction.followup.send(f"🎶 Lyrics for **{title} - {artist}** (fetched in {elapsed:.1f}s):")
+        # send header and chunked lyrics
+        await interaction.followup.send(f"🎶 Lyrics for **{title} - {artist}** (via {used}, {elapsed:.1f}s):")
         for i in range(0, len(lyrics), 1900):
             chunk = lyrics[i:i+1900]
             try:
                 await interaction.followup.send(f"```{chunk}```")
-                # small pause to avoid rate-limit bursts
                 await asyncio.sleep(0.25)
             except Exception as e:
-                print("[lyrics] Error sending chunk:", e)
-                # continue trying next chunk
-        print(f"[lyrics] Completed sending lyrics for {query!r} (total time {time.time()-start_time:.2f}s)")
+                print("[lyricscmd] chunk send error:", e)
+        print(f"[lyricscmd] completed send (provider={used}) total_time={time.time()-start:.2f}s")
     except Exception as e:
-        print("[lyrics] Unexpected error in handler:", e)
+        print("[lyricscmd] unexpected handler error:", e)
         traceback.print_exc()
         try:
-            await interaction.followup.send("⚠️ Unexpected error while fetching lyrics. Check bot logs.")
+            await interaction.followup.send("⚠️ Unexpected error while fetching lyrics. Check logs.")
         except Exception:
             pass
+# --- End DIAGNOSTIC + FALLBACK lyrics code ---
+
+
