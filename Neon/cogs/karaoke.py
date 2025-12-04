@@ -1,252 +1,124 @@
+# --- defensive lyrics fetch + robust /lyrics command ---
 import asyncio
-import os
-from typing import Dict, Any, Optional
-from pathlib import Path
+import time
+import traceback
 
-import discord
-from discord.ext import commands
-from discord import app_commands
-import lyricsgenius
+# Ensure genus client exists (if you create it elsewhere, skip this)
+try:
+    import lyricsgenius
+except Exception:
+    lyricsgenius = None
 
-# Short helper for settings manager import
-from cogs.settings import SettingsManager, SETTINGS_FILE, DATA_DIR
-
-# load or create settings manager
-settings = SettingsManager(SETTINGS_FILE)
-
-# Genius client (sync calls are run in executor)
-GENIUS_TOKEN = os.getenv("GENIUS_API_TOKEN")
-if not GENIUS_TOKEN:
-    raise RuntimeError("GENIUS_API_TOKEN environment variable is not set.")
-
-genius = lyricsgenius.Genius(GENIUS_TOKEN)
-genius.skip_non_songs = True
-genius.excluded_terms = ["(Remix)", "(Live)"]
-genius.remove_section_headers = False
-
-# In-memory karaoke state
-# guild_id -> { "running": bool, "paused": bool, "task": asyncio.Task, "control_message_id": int, "lock": asyncio.Lock }
-karaoke_state: Dict[int, Dict[str, Any]] = {}
-
-
-async def fetch_song(query: str):
-    # Run blocking search in thread
-    return await asyncio.to_thread(genius.search_song, query)
-
-
-async def run_karaoke(channel: discord.abc.Messageable, guild_id: int, title_display: str, lyrics: str, delay: float):
-    lines = lyrics.split("\n")
+# If you create Genius client at cog init, prefer that. Example fallback:
+def make_genius_client(token: str):
+    if not token or lyricsgenius is None:
+        return None
     try:
-        await channel.send(f"🎤 **Karaoke started:** {title_display}")
-
-        for line in lines:
-            state = karaoke_state.get(guild_id)
-            if not state or not state.get("running"):
-                await channel.send("⏹ Karaoke stopped.")
-                return
-
-            # pause loop
-            while state.get("paused"):
-                await asyncio.sleep(0.8)
-                state = karaoke_state.get(guild_id)
-                if not state or not state.get("running"):
-                    await channel.send("⏹ Karaoke stopped.")
-                    return
-
-            if line.strip():
-                await channel.send(line)
-                await asyncio.sleep(delay)
-
-        await channel.send("✅ Karaoke finished!")
-    except asyncio.CancelledError:
-        await channel.send("⏹ Karaoke cancelled.")
+        g = lyricsgenius.Genius(token,
+                                skip_non_songs=True,
+                                excluded_terms=["(Remix)", "(Live)"],
+                                timeout=10)  # optional param
+        # tune attributes to be safe
+        g.verbose = False
+        g.remove_section_headers = True
+        return g
     except Exception as e:
-        await channel.send(f"⚠️ Error during karaoke: {e}")
-    finally:
-        # cleanup
-        karaoke_state.pop(guild_id, None)
+        print("Failed to create lyricsgenius client:", e)
+        return None
 
+# If cog has no self.genius, create one on first use
+async def _ensure_genius(self):
+    if getattr(self, "genius", None) is None:
+        token = os.getenv("GENIUS_API_TOKEN")
+        self.genius = make_genius_client(token)
+    return getattr(self, "genius", None)
 
-class KaraokeCog(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
+async def _fetch_song_with_timeout(self, query: str, timeout: float = 15.0, retries: int = 2):
+    """
+    Run genius.search_song in a thread with asyncio.wait_for and retries.
+    Returns a song object or None on failure.
+    Logs detailed info for debug.
+    """
+    genius = await _ensure_genius(self)
+    if genius is None:
+        print("[lyrics] Genius client not available (missing lyricsgenius or token).")
+        return None
 
-    # Small utility to create control message and add reactions
-    async def _make_control_message(self, channel: discord.TextChannel):
-        msg = await channel.send(
-            "🎛️ Karaoke controls:\n▶ – resume/play\n⏸ – pause\n⏹ – stop"
-        )
-        for emoji in ("⏸", "▶", "⏹"):
-            try:
-                await msg.add_reaction(emoji)
-            except Exception:
-                pass
-        return msg
-
-    @app_commands.command(name="ping", description="Check if the bot is alive.")
-    async def ping(self, interaction: discord.Interaction):
-        await interaction.response.send_message("🏓 Pong! I'm alive.", ephemeral=True)
-
-    @app_commands.command(name="lyrics", description="Fetch full lyrics for a song.")
-    @app_commands.describe(query="Song name or 'Artist - Title'")
-    async def lyrics_cmd(self, interaction: discord.Interaction, query: str):
-        await interaction.response.defer(thinking=True)
-        song = await fetch_song(query)
-        if not song:
-            await interaction.followup.send("❌ Song not found or Genius API error.")
-            return
-
-        title_display = f"{song.title} - {song.artist}"
-        lyrics = song.lyrics or "No lyrics found."
-        chunks = [lyrics[i : i + 1900] for i in range(0, len(lyrics), 1900)]
-        await interaction.followup.send(f"🎶 Lyrics for **{title_display}**:")
-        for chunk in chunks:
-            await interaction.followup.send(f"```{chunk}```")
-
-    @app_commands.command(name="karaoke", description="Sing a song line by line (karaoke mode).")
-    @app_commands.describe(query="Song name or 'Artist - Title'", delay="Delay in seconds between lines (overrides guild default)")
-    async def karaoke(self, interaction: discord.Interaction, query: str, delay: Optional[float] = None):
-        if not interaction.guild:
-            await interaction.response.send_message("This command only works in servers.", ephemeral=True)
-            return
-
-        guild_id = interaction.guild_id
-        # Use guild default if not provided
-        if delay is None:
-            delay = await settings.get_delay(guild_id, default=2.0)
-        else:
-            # bound checking
-            if delay < 0.1 or delay > 10:
-                await interaction.response.send_message("Delay must be between 0.1 and 10 seconds.", ephemeral=True)
-                return
-
-        # If karaoke already running, stop previous
-        existing = karaoke_state.get(guild_id)
-        if existing and existing.get("running"):
-            existing["running"] = False
-            t = existing.get("task")
-            if t and not t.done():
-                t.cancel()
-
-        await interaction.response.defer(thinking=True)
-        song = await fetch_song(query)
-        if not song:
-            await interaction.followup.send("❌ Song not found or Genius API error.")
-            return
-
-        title_display = f"{song.title} - {song.artist}"
-        lyrics = song.lyrics or "No lyrics found."
-
-        # Create control message and add reactions
-        control_msg = await self._make_control_message(interaction.channel)
-
-        # create task
-        task = asyncio.create_task(run_karaoke(interaction.channel, guild_id, title_display, lyrics, delay))
-
-        karaoke_state[guild_id] = {
-            "running": True,
-            "paused": False,
-            "task": task,
-            "control_message_id": control_msg.id,
-            "lock": asyncio.Lock(),
-        }
-
-        await interaction.followup.send(f"🎤 Karaoke for **{title_display}** started (delay={delay}s). Use the control message reactions or slash commands to control.", ephemeral=False)
-
-    # Slash commands to control (alternative to reactions)
-    @app_commands.command(name="pausekaraoke", description="Pause the karaoke in this server.")
-    async def pausekaraoke(self, interaction: discord.Interaction):
-        if not interaction.guild:
-            await interaction.response.send_message("Use this in a server.", ephemeral=True)
-            return
-
-        state = karaoke_state.get(interaction.guild_id)
-        if not state or not state.get("running"):
-            await interaction.response.send_message("ℹ️ No karaoke is running right now.", ephemeral=True)
-            return
-
-        if state.get("paused"):
-            await interaction.response.send_message("ℹ️ Karaoke is already paused.", ephemeral=True)
-            return
-
-        state["paused"] = True
-        await interaction.response.send_message("⏸ Karaoke paused.", ephemeral=False)
-
-    @app_commands.command(name="resumekaraoke", description="Resume the karaoke in this server.")
-    async def resumekaraoke(self, interaction: discord.Interaction):
-        if not interaction.guild:
-            await interaction.response.send_message("Use this in a server.", ephemeral=True)
-            return
-
-        state = karaoke_state.get(interaction.guild_id)
-        if not state or not state.get("running"):
-            await interaction.response.send_message("ℹ️ No karaoke is running right now.", ephemeral=True)
-            return
-
-        if not state.get("paused"):
-            await interaction.response.send_message("ℹ️ Karaoke is not paused.", ephemeral=True)
-            return
-
-        state["paused"] = False
-        await interaction.response.send_message("▶ Karaoke resumed.", ephemeral=False)
-
-    @app_commands.command(name="stopkaraoke", description="Stop the karaoke in this server.")
-    async def stopkaraoke(self, interaction: discord.Interaction):
-        if not interaction.guild:
-            await interaction.response.send_message("Use this in a server.", ephemeral=True)
-            return
-
-        state = karaoke_state.get(interaction.guild_id)
-        if not state or not state.get("running"):
-            await interaction.response.send_message("ℹ️ No karaoke is running right now.", ephemeral=True)
-            return
-
-        state["running"] = False
-        t = state.get("task")
-        if t and not t.done():
-            t.cancel()
-        await interaction.response.send_message("🛑 Karaoke stopped.", ephemeral=False)
-
-    # Reaction handling - global listener in this cog's on_reaction_add
-    @commands.Cog.listener()
-    async def on_reaction_add(self, reaction: discord.Reaction, user: discord.User):
-        if user.bot:
-            return
-
-        message = reaction.message
-        guild = message.guild
-        if not guild:
-            return
-
-        state = karaoke_state.get(guild.id)
-        if not state:
-            return
-
-        if message.id != state.get("control_message_id"):
-            return
-
-        emoji = str(reaction.emoji)
-        # remove user reaction for tidiness
+    attempt = 0
+    last_exc = None
+    while attempt <= retries:
+        attempt += 1
+        start_t = time.time()
         try:
-            await message.remove_reaction(reaction.emoji, user)
+            # Run blocking search in a thread
+            coro = asyncio.to_thread(genius.search_song, query)
+            song = await asyncio.wait_for(coro, timeout=timeout)
+            elapsed = time.time() - start_t
+            print(f"[lyrics] Genius.search_song success (attempt {attempt}) query={query!r} elapsed={elapsed:.2f}s")
+            return song
+        except asyncio.TimeoutError:
+            print(f"[lyrics] Timeout (attempt {attempt}) for query={query!r} after {timeout}s")
+            last_exc = asyncio.TimeoutError()
+        except Exception as e:
+            # log full traceback
+            print(f"[lyrics] Exception (attempt {attempt}) for query={query!r}: {e}")
+            traceback.print_exc()
+            last_exc = e
+
+        # small backoff before retry
+        await asyncio.sleep(0.5 * attempt)
+
+    print(f"[lyrics] All attempts failed for query={query!r}; last_exc={last_exc}")
+    return None
+
+
+# Slash command replacement
+from discord import app_commands
+
+@app_commands.command(name="lyrics", description="Fetch full lyrics for a song (safe timeout + retry).")
+@app_commands.describe(query="Song name or 'Artist - Title'")
+async def lyrics_cmd(self, interaction: discord.Interaction, query: str):
+    # show "thinking" UI to prevent "unresponded" UI
+    await interaction.response.defer(thinking=True)
+
+    try:
+        start = time.time()
+        song = await _fetch_song_with_timeout(self, query, timeout=15.0, retries=2)
+        elapsed = time.time() - start
+        if not song:
+            # clearly communicate cause & give diagnostics instructions
+            await interaction.followup.send(
+                "❌ Could not fetch lyrics (timeout/remote error). "
+                "This may be a network/egress issue from the host or Genius rate-limiting.\n\n"
+                "If this keeps happening, please run the `render shell` checks and paste logs.\n"
+                f"(attempted for {elapsed:.1f}s)"
+            )
+            return
+
+        # Got a song — prepare and send in chunks
+        lyrics = getattr(song, "lyrics", None) or ""
+        title_display = f"{getattr(song,'title','Unknown')} - {getattr(song,'artist','Unknown')}"
+        if not lyrics.strip():
+            await interaction.followup.send(f"ℹ️ Found song **{title_display}**, but no lyrics were returned.")
+            return
+
+        # Split into 1900-char chunks and send
+        await interaction.followup.send(f"🎶 Lyrics for **{title_display}** (fetched in {elapsed:.1f}s):")
+        for i in range(0, len(lyrics), 1900):
+            chunk = lyrics[i:i+1900]
+            # send code block for readability; smaller send intervals to dodge rate limits
+            try:
+                await interaction.followup.send(f"```{chunk}```")
+                await asyncio.sleep(0.25)
+            except Exception as e:
+                print("[lyrics] Error sending chunk:", e)
+                # continue trying next chunk
+        return
+
+    except Exception as e:
+        print("[lyrics] Unexpected handler error:", e)
+        traceback.print_exc()
+        try:
+            await interaction.followup.send("⚠️ Unexpected error while fetching lyrics. Check bot logs.")
         except Exception:
             pass
-
-        if emoji == "⏸":
-            if not state.get("paused"):
-                state["paused"] = True
-                await message.channel.send("⏸ Karaoke paused.")
-        elif emoji == "▶":
-            if state.get("paused"):
-                state["paused"] = False
-                await message.channel.send("▶ Karaoke resumed.")
-        elif emoji == "⏹":
-            state["running"] = False
-            t = state.get("task")
-            if t and not t.done():
-                t.cancel()
-            await message.channel.send("🛑 Karaoke stopped.")
-
-
-async def setup(bot):
-    await bot.add_cog(KaraokeCog(bot))
