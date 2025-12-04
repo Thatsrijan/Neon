@@ -1,4 +1,5 @@
-discord.py==2.3.3
+discord.py==2.6.4
 lyricsgenius==3.2.2
 flask==2.3.3
 python-dotenv==1.0.0
+
